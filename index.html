@@ -352,7 +352,7 @@ window.addEventListener('load',()=>{
   qs('#lp').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
   const c=gcfg();
   if(c){
-    S.cid=c.clientId; S.did=c.deviceId; S.sl=b2a(c.salt);
+    S.cid=c.clientId; S.did=c.deviceId;
     // Restore refresh token from sessionStorage if available
     const rt=sessionStorage.getItem('kv2_rt');
     if(rt) S.rt=rt;
@@ -377,6 +377,7 @@ function backToLand(){showSc('s-land');}
 // ── Config ────────────────────────────────────────────────────
 function gcfg(){try{return JSON.parse(localStorage.getItem('kv2'))||null;}catch{return null;}}
 function scfg(o){localStorage.setItem('kv2',JSON.stringify(o));}
+// Salt is no longer stored in localStorage — it lives in the OneDrive config file
 function gdid(){let d=localStorage.getItem('kv2_did');if(!d){const b=crypto.getRandomValues(new Uint8Array(16));d=Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join('');localStorage.setItem('kv2_did',d);}return d;}
 
 // ── Crypto ────────────────────────────────────────────────────
@@ -447,14 +448,18 @@ async function doStep3(){
     up('Saving encrypted vault...');
     const vc={totpSecret:S.ss,trustedDevices:[{id:S.did,name:'Primary Device',ts:Date.now()}],folders:[],pwAttempts:0,pwLockUntil:0,tfaAttempts:0,tfaLockUntil:0,v:2};
     await mkdr(VAULT);
-    await putf(`/me/drive/root:/${VAULT}/${CFG}:/content`,await encJ(vc,S.key));
-    // Only save config AFTER OneDrive write confirmed — prevents salt mismatch
-    const saltB64=a2b(S.sl);
-    scfg({clientId:S.cid,deviceId:S.did,salt:saltB64});
-    // Store refresh token in sessionStorage — survives page refresh, not tab close
+    // Embed salt at start of config file — salt and config always in sync
+    const encData=await encJ(vc,S.key);
+    const cfgFile=new Uint8Array(SLN+encData.length);
+    cfgFile.set(S.sl); cfgFile.set(encData,SLN);
+    await putf(`/me/drive/root:/${VAULT}/${CFG}:/content`,cfgFile);
+    // Save ONLY clientId and deviceId locally — NO salt needed locally anymore
+    scfg({clientId:S.cid,deviceId:S.did});
     if(S.rt) sessionStorage.setItem('kv2_rt',S.rt);
-    S.totp=S.ss;S.folders=[];S.ss=null;S.sl=null;
-    localStorage.removeItem('kv2_setup_salt'); // cleanup temp salt
+    S._salt=cfgFile.slice(0,SLN); // keep salt in memory for wvc calls
+    S.totp=S.ss;S.folders=[];
+    localStorage.removeItem('kv2_setup_salt');
+    S.ss=null;S.sl=null;
     hp();showSc('s-home');await loadF();startLT();
   }catch(err){hp();se(qs('#e3'),'Connection failed: '+err.message);qs('#btn-drive').disabled=false;qs('#btn-drive').textContent='Connect OneDrive →';}
 }
@@ -492,11 +497,19 @@ async function doLogin(){
   const pb=new TextEncoder().encode(pw);qs('#lp').value='';
   sp('Verifying password...');
   try{
-    const cfg=gcfg();const salt=b2a(cfg.salt||localStorage.getItem('kv2_setup_salt')||'');const key=await dkey(pb,salt);z(pb);
+    // Read salt from the config file itself — always in sync, no localStorage needed
+    const raw=await dlf(`/me/drive/root:/${VAULT}/${CFG}`);
+    if(!raw||raw.length<SLN+IVL){
+      hp();se(e,'Vault not found on OneDrive. Please create a new vault.');
+      qs('#btn-login').disabled=false;qs('#btn-login').textContent='Unlock Vault 🔓';return;
+    }
+    const salt=raw.slice(0,SLN); // first 32 bytes = salt
+    const encPart=raw.slice(SLN); // rest = encrypted config
+    const key=await dkey(pb,salt);z(pb);
     let vc;
-    try{const raw=await dlf(`/me/drive/root:/${VAULT}/${CFG}`);vc=await decJ(raw,key);if(!vc||!vc.totpSecret)throw new Error('bad');}
+    try{vc=await decJ(encPart,key);if(!vc||!vc.totpSecret)throw new Error('bad');}
     catch{hp();const att=(pre.pwAttempts||0)+1;const lk=att>=MPA?Date.now()+lkms(att):0;await saveAtt(att,lk);const left=MPA-att;if(lk)se(e,`Too many attempts. Locked for ${Math.ceil(lkms(att)/60000)} minute(s).`);else se(e,`Wrong password. ${left>0?left+' attempt(s) remaining.':'Account locked.'}`);qs('#btn-login').disabled=false;qs('#btn-login').textContent='Unlock Vault 🔓';await updAtUI();return;}
-    S.key=key;S.totp=vc.totpSecret;S.folders=vc.folders||[];
+    S.key=key;S._salt=salt;S.totp=vc.totpSecret;S.folders=vc.folders||[];
     vc.pwAttempts=0;vc.pwLockUntil=0;
     await putf(`/me/drive/root:/${VAULT}/${CFG}:/content`,await encJ(vc,S.key));
     // Save refresh token so next page load doesn't need popup
@@ -524,10 +537,18 @@ async function doVerify2FA(){
 
 // ── Lock/Unlock ───────────────────────────────────────────────
 function unlockV(cfg){S.folders=cfg.folders||[];showSc('s-home');renderF();startLT();}
-function doLock(){S.key=null;S.totp=null;S.at=null;S.rt=null;S.photos=[];S.tc=null;clearTimeout(S.lt);clearInterval(S.lct);clearInterval(S.ti);
-  // Clear refresh token on explicit lock — forces Microsoft re-login
-  sessionStorage.removeItem('kv2_rt');
-  switchTab('login');showSc('s-land');qs('#lp').value='';hide(qs('#le'));}
+function doLock(){
+  // Wipe sensitive crypto data from memory
+  S.key=null; S._salt=null; S.totp=null; S.at=null; S.rt=null;
+  S.photos=[]; S.tc=null;
+  clearTimeout(S.lt); clearInterval(S.lct); clearInterval(S.ti);
+  // NOTE: We do NOT clear sessionStorage 'kv2_rt' here
+  // The refresh token in sessionStorage lets us reconnect to OneDrive
+  // after re-entering the master password — without a new Microsoft popup
+  // It is NOT sensitive on its own — it cannot decrypt files without the password
+  switchTab('login'); showSc('s-land');
+  qs('#lp').value=''; hide(qs('#le'));
+}
 function startLT(){clearTimeout(S.lt);clearInterval(S.lct);S.lt=setTimeout(doLock,ALK);let ms=ALK;S.lct=setInterval(()=>{ms-=1000;if(ms<=0){clearInterval(S.lct);return;}const el=qs('#lcd');if(el)el.textContent=`Auto-locks in ${Math.floor(ms/60000)}:${Math.floor((ms%60000)/1000).toString().padStart(2,'0')}`;},1000);}
 function rlt(){if(S.key)startLT();}
 
@@ -547,7 +568,9 @@ async function putf(path,data){const r=await fetch(GR+path,{method:'PUT',headers
 async function dlf(path){try{const i=await gql(path);if(!i)return null;const r=await fetch(i['@microsoft.graph.downloadUrl']);return r.ok?new Uint8Array(await r.arrayBuffer()):null;}catch{return null;}}
 async function mkdr(name){await gql('/me/drive/root/children','POST',{name,folder:{},['@microsoft.graph.conflictBehavior']:'replace'});}
 async function refTok(){
-  if(!S.rt){const cid=gcfg()?.clientId;if(!cid)throw new Error('Not configured');const{code,ver}=await popOAuth(cid);const tok=await xchg(cid,code,ver);S.at=tok.access_token;S.rt=tok.refresh_token;return;}
+  // Try to restore rt from sessionStorage if not in memory
+  if(!S.rt){const stored=sessionStorage.getItem('kv2_rt');if(stored)S.rt=stored;}
+  if(!S.rt){const cid=gcfg()?.clientId;if(!cid)throw new Error('Not configured');const{code,ver}=await popOAuth(cid);const tok=await xchg(cid,code,ver);S.at=tok.access_token;S.rt=tok.refresh_token;sessionStorage.setItem('kv2_rt',S.rt);return;}
   const cid=gcfg()?.clientId;
   const r=await fetch(TEP,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:cid,grant_type:'refresh_token',refresh_token:S.rt,scope:SC})});
   const d=await r.json();if(!d.access_token){S.rt=null;throw new Error('Re-auth required');}
@@ -560,9 +583,21 @@ async function saveAtt(a,l){try{await putf(`/me/drive/root:/${VAULT}/.kv-att:/co
 function lkms(a){return 60000*Math.pow(5,Math.max(0,a-MPA));}
 async function updAtUI(){if(!S.at)return;try{const d=await getAtt();const el=qs('#atw');if(d.pwAttempts>=3){el.textContent=`⚠️ ${d.pwAttempts} failed attempts on record.`;el.classList.add('on');}}catch{}}
 
-// ── Vault config ──────────────────────────────────────────────
-async function rvc(){const r=await dlf(`/me/drive/root:/${VAULT}/${CFG}`);return r?decJ(r,S.key):null;}
-async function wvc(c){await putf(`/me/drive/root:/${VAULT}/${CFG}:/content`,await encJ(c,S.key));}
+// ── Vault config — salt embedded in file (eliminates sync issues) ──
+// Format: [32 bytes salt unencrypted][12 bytes IV][AES-256-GCM encrypted JSON]
+async function rvc(){
+  const r=await dlf(`/me/drive/root:/${VAULT}/${CFG}`);
+  if(!r||r.length<SLN) return null;
+  try{return decJ(r.slice(SLN),S.key);}catch{return null;}
+}
+async function wvc(c){
+  // We need the salt — it's stored in S._salt after login
+  if(!S._salt){console.error('No salt in memory');return;}
+  const encData=await encJ(c,S.key);
+  const out=new Uint8Array(SLN+encData.length);
+  out.set(S._salt); out.set(encData,SLN);
+  await putf(`/me/drive/root:/${VAULT}/${CFG}:/content`,out);
+}
 
 // ── Folders ───────────────────────────────────────────────────
 async function loadF(){const c=await rvc();if(c)S.folders=c.folders||[];renderF();}
@@ -579,7 +614,9 @@ async function doAddFolder(){
   try{
     const info=await gql(`/me/drive/root:/${encodeURIComponent(name)}`);if(!info)throw new Error(`Folder "${name}" not found on OneDrive`);
     S.folders.push({name,count:0,lastSync:null,added:Date.now()});
-    const c=await rvc();c.folders=S.folders;await wvc(c);hp();renderF();qs('#fn').value='';
+    let c=await rvc();
+    if(!c) c={totpSecret:S.totp,trustedDevices:[{id:S.did||gdid(),name:'Device',ts:Date.now()}],folders:[],pwAttempts:0,pwLockUntil:0,tfaAttempts:0,tfaLockUntil:0,v:2};
+    c.folders=S.folders;await wvc(c);hp();renderF();qs('#fn').value='';
   }catch(err){hp();se(qs('#fe'),err.message);openSh('sh-add');}
 }
 
